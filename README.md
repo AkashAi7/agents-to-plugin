@@ -6,7 +6,7 @@ Drop your `*.agent.md` files into an `agents/` folder, run one script, and get a
 
 ```text
 your-repo/
-├── agents/                                  ← you write these
+├── agents/                                  ← you write these (*.agent.md)
 │   └── my-agent.agent.md
 ├── .github/plugin/marketplace.json          ← generated: plugin marketplace manifest
 ├── plugin.json                              ← generated: Agent Plugins 1.0 manifest
@@ -26,7 +26,7 @@ From the root of any git repository that has an `agents/` directory and a GitHub
 # Python (any OS, Python 3.9+, stdlib only)
 python scripts/sync-agents-to-plugin.py
 
-# or PowerShell
+# or the PowerShell wrapper (delegates to the same Python engine)
 ./scripts/sync-agents-to-plugin.ps1
 ```
 
@@ -41,28 +41,43 @@ copilot plugin install <owner>-agents@<owner>-marketplace
 
 On every run it:
 
-1. **Discovers agents** — top-level Markdown files in `agents/` with closed YAML frontmatter (`---` … `---`). Commented-out templates and plain docs are skipped automatically.
-2. **Creates or updates `.github/plugin/marketplace.json`** — the marketplace is created if missing (named `<owner>-marketplace` from your git remote); existing names, authors, and unrelated plugins are preserved.
-3. **Creates or updates `plugin.json`** — the Agent Plugins 1.0 manifest (named `<owner>-agents` when created).
-4. **Mirrors agents into `com.github.copilot/agents/`** — and prunes stale mirrors for agents you deleted, without touching unmanaged files.
-5. **Populates `copilot/managed-settings.json`** — registers the marketplace and enables the plugin so GitHub Enterprise managed clients receive it automatically (existing settings are merged, never overwritten).
-6. **Validates** all generated JSON and every referenced agent path.
+1. **Resolves the target repository** — `--root PATH` if given, else the current `git rev-parse --show-toplevel`, else the script's parent repository. The resolved root is printed before anything is touched.
+2. **Discovers agents** — `agents/*.agent.md` files with closed YAML frontmatter containing a `description`. A malformed `*.agent.md` is a **hard error** (so a typo can't silently drop an agent from the plugin); other Markdown files are ignored with a notice.
+3. **Validates everything up front** — all existing manifests and settings are parsed and type/name/version-checked *before* any file is modified; failures leave the repository untouched.
+4. **Creates or updates `plugin.json`** — Agent Plugins 1.0 manifest (named `<owner>-agents` when created; existing names win). Names must be lowercase kebab/dot style.
+5. **Creates or updates `.github/plugin/marketplace.json`** — the plugin entry's `agents` **and `version`** are synchronized; existing metadata, authors, and unrelated plugins are preserved. Duplicate entries or a non-root plugin `source` are rejected (`./` and `.` are both accepted).
+6. **Mirrors agents into `com.github.copilot/agents/`** — pruning only mirrors the converter itself previously registered; unmanaged files are never touched; symlinks are refused.
+7. **Merges `copilot/managed-settings.json`** — registers the marketplace (`autoUpdate: true`) and enables `plugin@marketplace`. On a rename, stale entries pointing at this same repository are cleaned up; settings for other repositories are never modified.
+8. **Writes atomically** — JSON files are written via same-directory temp files and `os.replace`.
 
-It is **idempotent**: re-running without changes produces byte-identical output. It is **scale-ready**: add, amend, or delete agents and re-run to repopulate everything.
+### Version policy
+
+Enterprise clients rely on version metadata to pick up updates, so the converter manages it:
+
+- New manifests start at `1.0.0`.
+- If any agent content or the agent list changed since the last run, the patch version is bumped automatically.
+- `--version X.Y.Z` sets it explicitly (e.g. for minor/major bumps).
+- The marketplace entry's `version` always mirrors `plugin.json`.
+
+Re-running with no changes is byte-identical (no spurious bumps).
 
 ### Options
 
 | Python | PowerShell | Effect |
 |---|---|---|
-| `--marketplace-name NAME` | `-MarketplaceName NAME` | Name used when *creating* a marketplace (existing names are kept) |
+| `--root PATH` | `-Root PATH` | Target repository (default: current git toplevel) |
+| `--marketplace-name NAME` | `-MarketplaceName NAME` | Name used when *creating* a marketplace |
 | `--plugin-name NAME` | `-PluginName NAME` | Name used when *creating* a plugin manifest |
-| `--install` | `-Install` | Also register + install + enable the plugin in your local Copilot CLI |
+| `--version X.Y.Z` | `-Version X.Y.Z` | Explicit version (default: auto patch-bump on change) |
+| `--install` | `-Install` | Also register + install + enable in the local Copilot CLI |
 
 > `--install` requires the GitHub Copilot CLI to be installed and signed in, and the repo must already be pushed to GitHub (the CLI installs from the remote).
 
+**Single engine:** `sync-agents-to-plugin.ps1` is a thin launcher around the Python script — there is exactly one implementation of the conversion logic, and the test suite covers it on every platform. The wrapper requires Python 3.9+ on PATH.
+
 ## Local install/uninstall helper
 
-`scripts/setup-plugin.ps1` is a standalone idempotent installer for consumers of your plugin (defaults are wired for its original repo — edit the three variables at the top for yours):
+`scripts/setup-plugin.ps1` installs/uninstalls the plugin a repository publishes. Run it from that repository's root — it derives the repo slug, marketplace, and plugin names from the generated manifests and git remote (all overridable via `-Repo`, `-MarketplaceName`, `-PluginName`):
 
 ```powershell
 ./scripts/setup-plugin.ps1                  # register marketplace + install + enable
@@ -72,13 +87,12 @@ It is **idempotent**: re-running without changes produces byte-identical output.
 ## Requirements
 
 - git, with a GitHub `origin` remote (`https`, `ssh`, or `git@` forms all work)
-- **Python script**: Python 3.9+ (standard library only — no pip installs)
-- **PowerShell script**: PowerShell 5.1+ / PowerShell Core
+- Python 3.9+ (standard library only — no pip installs); PowerShell 5.1+/Core for the wrappers
 - GitHub Copilot CLI — only for `--install` / `setup-plugin.ps1`
 
 ## Agent file format
 
-Only files like this count as agents (anything else in `agents/` is ignored):
+Only `agents/*.agent.md` files count as agents, and they must look like this:
 
 ```markdown
 ---
@@ -88,13 +102,21 @@ description: What this agent does and when to use it.
 You are a specialist at ...
 ```
 
+A `*.agent.md` without valid frontmatter or a description fails the run. Other `.md` files (docs, commented-out templates) are listed as skipped and otherwise ignored.
+
 ## Tests
 
 ```bash
 python -B -m unittest discover -s scripts -p "test_sync_agents_to_plugin.py"
 ```
 
-The suite covers from-scratch creation, idempotence, add/amend/remove cycles, preservation of existing metadata and unrelated plugins, malformed-input safety, and the install flow (mocked — no local CLI state is touched).
+13 cases cover from-scratch creation, byte-identical idempotence, version bump/propagation, add/amend/remove cycles, unmanaged-file preservation, metadata/other-plugin preservation, rename cleanup of managed settings, malformed-input safety with zero partial writes, source-path equivalence, `--root`/git-toplevel resolution, exact-token CLI matching, the mocked install flow, and wrapper delegation.
+
+## Known limitations
+
+- Frontmatter parsing is a deliberate subset of YAML (simple `key: value` lines); block scalars and multi-line values are not interpreted.
+- Removing the *last* agent aborts rather than tearing down generated files — delete them manually (or `git revert`) for teardown.
+- End-to-end client auto-update behavior should be verified against a real Copilot client; the test suite validates manifests, not client delivery.
 
 ## License
 

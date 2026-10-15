@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
-"""Create or refresh a plugin marketplace, plugin manifest, and managed-settings distribution from agents/, using only Python's stdlib."""
+"""Convert Copilot custom agents into a plugin marketplace setup.
+
+Generates/updates .github/plugin/marketplace.json, plugin.json,
+com.github.copilot/agents/ mirrors, and copilot/managed-settings.json
+from the agents/ directory. Stdlib only; idempotent; validates all
+inputs before mutating anything.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
+
+NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
 def run(command: list[str], root: Path) -> str:
@@ -29,43 +40,83 @@ def read_object(path: Path) -> dict[str, Any]:
 
 
 def write_object(path: Path, value: dict[str, Any]) -> None:
+    """Write JSON atomically via a same-directory temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    text = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+    descriptor, temp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+        os.replace(temp_name, path)
+    except BaseException:
+        os.unlink(temp_name)
+        raise
+
+
+def check_name(kind: str, name: Any) -> str:
+    if not isinstance(name, str) or not NAME_PATTERN.fullmatch(name):
+        raise ValueError(
+            f"{kind} name {name!r} must be 2-64 lowercase letters, digits, '.', '_' or '-'"
+        )
+    return name
+
+
+def check_version(version: Any) -> str:
+    if not isinstance(version, str) or not VERSION_PATTERN.fullmatch(version):
+        raise ValueError(f"Version {version!r} must be MAJOR.MINOR.PATCH digits")
+    return version
+
+
+def bump_patch(version: str) -> str:
+    major, minor, patch = VERSION_PATTERN.fullmatch(version).groups()
+    return f"{major}.{minor}.{int(patch) + 1}"
 
 
 def discover_agents(root: Path) -> list[tuple[Path, str]]:
+    """Return (path, display name) for every agents/*.agent.md file.
+
+    An *.agent.md file with missing, unopened, or unclosed frontmatter, or
+    without a description, is an error. Other Markdown files are ignored.
+    """
     directory = root / "agents"
     if not directory.is_dir():
         raise ValueError(f"No agents directory found at {directory}")
     agents = []
+    skipped = []
     for path in sorted(directory.glob("*.md"), key=lambda item: item.name.casefold()):
         if not path.is_file():
             continue
+        if not path.name.endswith(".agent.md"):
+            skipped.append(path.name)
+            continue
         lines = path.read_text(encoding="utf-8-sig").lstrip().splitlines()
         if not lines or lines[0].strip() != "---":
-            continue
+            raise ValueError(f"{path}: agent file must start with '---' YAML frontmatter")
         end = next(
             (index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"),
             None,
         )
         if end is None:
             raise ValueError(f"{path}: frontmatter has no closing ---")
-        name = path.stem.removesuffix(".agent")
+        fields = {}
         for line in lines[1:end]:
-            match = re.match(r"^name:\s*(.+)$", line)
+            match = re.match(r"^(name|description):\s*(.+)$", line)
             if match:
-                name = match[1].strip().strip("\"'")
-        agents.append((path, name))
+                fields[match[1]] = match[2].strip().strip("\"'")
+        if not fields.get("description"):
+            raise ValueError(f"{path}: frontmatter must define a non-empty description")
+        agents.append((path, fields.get("name") or path.name.removesuffix(".agent.md")))
+    if skipped:
+        print(f"Skipped {len(skipped)} non-agent Markdown file(s): {', '.join(skipped)}")
     if not agents:
-        raise ValueError(f"No agent definitions with frontmatter found in {directory}")
+        raise ValueError(
+            f"No *.agent.md files found in {directory}. "
+            "Existing generated manifests were left untouched; remove them manually to tear down."
+        )
     return agents
 
 
-def sync(
-    root: Path, marketplace_name: str | None = None, plugin_name: str | None = None
-) -> tuple[str, str, str]:
-    agents = discover_agents(root)
+def resolve_slug(root: Path) -> tuple[str, str]:
     remote = run(["git", "remote", "get-url", "origin"], root).strip()
     match = re.fullmatch(
         r"(?:https?://github\.com/|git@github\.com:|ssh://git@github\.com/)"
@@ -74,17 +125,38 @@ def sync(
     if not match:
         raise ValueError("The origin remote must identify a GitHub owner/repository")
     owner, repository = match.groups()
-    slug = f"{owner}/{repository}"
+    return owner, f"{owner}/{repository}"
+
+
+def is_root_source(source: Any) -> bool:
+    return isinstance(source, str) and source.strip().rstrip("/") in ("", ".")
+
+
+def sync(
+    root: Path,
+    marketplace_name: str | None = None,
+    plugin_name: str | None = None,
+    version: str | None = None,
+) -> tuple[str, str, str]:
+    agents = discover_agents(root)
+    owner, slug = resolve_slug(root)
     url = f"https://github.com/{slug}"
     source_paths = [f"./agents/{path.name}" for path, _ in agents]
     namespace_paths = [f"./com.github.copilot/agents/{path.name}" for path, _ in agents]
-    summary = ", ".join(name for _, name in agents)
+    names = ", ".join(name for _, name in agents)
+    summary = names if len(names) <= 120 else f"{len(agents)} agents"
     description = f"Custom agents for {owner}, auto-generated from agents/. Includes: {summary}."
+
+    # --- Phase 1: read and validate every input before mutating anything ---
     manifest_path = root / "plugin.json"
     marketplace_path = root / ".github" / "plugin" / "marketplace.json"
+    settings_path = root / "copilot" / "managed-settings.json"
+    if version is not None:
+        check_version(version)
+
     manifest = read_object(manifest_path) if manifest_path.exists() else {
         "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-        "name": plugin_name or f"{owner}-agents",
+        "name": check_name("Plugin", plugin_name or f"{owner}-agents"),
         "version": "1.0.0",
         "description": description,
         "repository": url,
@@ -92,7 +164,7 @@ def sync(
         "keywords": ["copilot", "custom-agents", owner],
     }
     marketplace = read_object(marketplace_path) if marketplace_path.exists() else {
-        "name": marketplace_name or f"{owner}-marketplace",
+        "name": check_name("Marketplace", marketplace_name or f"{owner}-marketplace"),
         "owner": {"name": owner},
         "metadata": {
             "description": f"Agent plugin marketplace for {owner}.",
@@ -100,15 +172,54 @@ def sync(
         },
         "plugins": [],
     }
-    plugin_name = manifest.get("name")
-    marketplace_name = marketplace.get("name")
-    if not isinstance(plugin_name, str) or not plugin_name.strip():
-        raise ValueError("plugin.json must have a non-empty name")
-    if not isinstance(marketplace_name, str) or not marketplace_name.strip():
-        raise ValueError("marketplace.json must have a non-empty name")
+    settings = read_object(settings_path) if settings_path.exists() else {}
+
+    plugin_name = check_name("Plugin", manifest.get("name"))
+    marketplace_name = check_name("Marketplace", marketplace.get("name"))
+    old_version = check_version(manifest.get("version", "1.0.0"))
     extensions = manifest.setdefault("extensions", {})
     if not isinstance(extensions, dict):
         raise ValueError("plugin.json extensions must be an object")
+    old_copilot = extensions.get("com.github.copilot", {})
+    if not isinstance(old_copilot, dict):
+        raise ValueError("plugin.json extension com.github.copilot must be an object")
+    old_paths = old_copilot.get("agents", [])
+    if not isinstance(old_paths, list) or any(not isinstance(p, str) for p in old_paths):
+        raise ValueError("Existing com.github.copilot agents must be an array of strings")
+    plugins = marketplace.get("plugins")
+    if not isinstance(plugins, list) or any(not isinstance(p, dict) for p in plugins):
+        raise ValueError("marketplace.json plugins must be an array of objects")
+    matches = [plugin for plugin in plugins if plugin.get("name") == plugin_name]
+    if len(matches) > 1:
+        raise ValueError(f"Duplicate marketplace entries for {plugin_name}")
+    if matches and not is_root_source(matches[0].get("source")):
+        raise ValueError(
+            f"{plugin_name}: marketplace source {matches[0].get('source')!r} does not point "
+            "at the repository root; this converter only manages root-sourced plugins"
+        )
+    marketplaces = settings.setdefault("extraKnownMarketplaces", {})
+    enabled = settings.setdefault("enabledPlugins", {})
+    if not isinstance(marketplaces, dict) or not isinstance(enabled, dict):
+        raise ValueError("managed-settings.json marketplace/plugin sections must be objects")
+
+    # --- Phase 2: detect content changes to drive the version policy ---
+    mirror = root / "com.github.copilot" / "agents"
+    changed = namespace_paths != old_paths
+    for path, _ in agents:
+        destination = mirror / path.name
+        if destination.is_symlink():
+            raise ValueError(f"Refusing to overwrite symlink: {destination}")
+        if not destination.is_file() or destination.read_bytes() != path.read_bytes():
+            changed = True
+    if version is not None:
+        new_version = version
+    elif manifest_path.exists() and changed:
+        new_version = bump_patch(old_version)
+    else:
+        new_version = old_version
+    manifest["version"] = new_version
+
+    # --- Phase 3: build remaining output state in memory ---
     for namespace, paths in (
         ("com.github.copilot", namespace_paths),
         ("com.github.awesome-copilot", source_paths),
@@ -117,42 +228,44 @@ def sync(
         if not isinstance(extension, dict):
             raise ValueError(f"plugin.json extension {namespace} must be an object")
         extension["agents"] = paths
-    plugins = marketplace.get("plugins")
-    if not isinstance(plugins, list) or any(not isinstance(p, dict) for p in plugins):
-        raise ValueError("marketplace.json plugins must be an array of objects")
-    matches = [plugin for plugin in plugins if plugin.get("name") == plugin_name]
-    if len(matches) > 1:
-        raise ValueError(f"Duplicate marketplace entries for {plugin_name}")
     if matches:
         entry = matches[0]
-        if entry.get("source") != "./":
-            raise ValueError(f"{plugin_name}: expected local root source './'")
     else:
         entry = {
             "name": plugin_name, "description": description,
-            "version": manifest.get("version", "1.0.0"), "repository": url, "source": "./",
+            "repository": url, "source": "./",
         }
         plugins.append(entry)
+    entry["version"] = new_version
     entry["agents"] = source_paths
 
-    # Prune only mirrors previously referenced by this plugin, never unrelated files.
-    old_paths = []
-    if manifest_path.exists():
-        old_paths = read_object(manifest_path).get("extensions", {}).get(
-            "com.github.copilot", {}
-        ).get("agents", [])
-        if not isinstance(old_paths, list):
-            raise ValueError("Existing Copilot agents must be an array")
-    mirror = root / "com.github.copilot" / "agents"
+    marketplace_plugins = {p.get("name") for p in plugins}
+    for stale in [
+        key for key, value in marketplaces.items()
+        if key != marketplace_name and isinstance(value, dict)
+        and value.get("source", {}).get("repo") == slug
+    ]:
+        del marketplaces[stale]
+        for qualified in [k for k in enabled if k.endswith(f"@{stale}")]:
+            del enabled[qualified]
+        print(f"Removed stale managed-settings entries for renamed marketplace: {stale}")
+    for qualified in [
+        k for k in enabled
+        if k.endswith(f"@{marketplace_name}") and k.rsplit("@", 1)[0] not in marketplace_plugins
+    ]:
+        del enabled[qualified]
+        print(f"Removed stale enabled plugin: {qualified}")
+    marketplaces[marketplace_name] = {
+        "source": {"source": "github", "repo": slug},
+        "autoUpdate": True,
+    }
+    enabled[f"{plugin_name}@{marketplace_name}"] = True
+
+    # --- Phase 4: mutate (mirrors first, then atomic JSON writes) ---
     mirror.mkdir(parents=True, exist_ok=True)
     for path, _ in agents:
-        destination = mirror / path.name
-        if destination.is_symlink():
-            raise ValueError(f"Refusing to overwrite symlink: {destination}")
-        shutil.copyfile(path, destination)
+        shutil.copyfile(path, mirror / path.name)
     for old in old_paths:
-        if not isinstance(old, str):
-            raise ValueError("Existing agent paths must be strings")
         candidate = root.joinpath(*old.removeprefix("./").split("/"))
         if (
             old not in namespace_paths and candidate.parent == mirror
@@ -160,25 +273,20 @@ def sync(
             and candidate.is_file()
         ):
             candidate.unlink()
+            print(f"Removed stale mirrored agent: {candidate.name}")
     write_object(manifest_path, manifest)
     write_object(marketplace_path, marketplace)
-
-    # Populate enterprise distribution so managed clients auto-receive the plugin.
-    settings_path = root / "copilot" / "managed-settings.json"
-    settings = read_object(settings_path) if settings_path.exists() else {}
-    marketplaces = settings.setdefault("extraKnownMarketplaces", {})
-    enabled = settings.setdefault("enabledPlugins", {})
-    if not isinstance(marketplaces, dict) or not isinstance(enabled, dict):
-        raise ValueError("managed-settings.json marketplace/plugin sections must be objects")
-    marketplaces[marketplace_name] = {
-        "source": {"source": "github", "repo": slug},
-        "autoUpdate": True,
-    }
-    enabled[f"{plugin_name}@{marketplace_name}"] = True
     write_object(settings_path, settings)
-    print(f"Marketplace: {marketplace_name}\nPlugin: {plugin_name}\nAgents ({len(agents)}): {summary}")
-    print(f"Managed settings: {settings_path}")
+    print(
+        f"Marketplace: {marketplace_name}\nPlugin: {plugin_name} (v{new_version})\n"
+        f"Agents ({len(agents)}): {names}\nManaged settings: {settings_path}"
+    )
     return slug, marketplace_name, plugin_name
+
+
+def cli_has_entry(output: str, name: str) -> bool:
+    """Exact-token match against copilot CLI list output (not substring)."""
+    return re.search(rf"(?m)(^|[\s•◆]){re.escape(name)}([\s(]|$)", output) is not None
 
 
 def install(root: Path, slug: str, marketplace: str, plugin: str) -> None:
@@ -186,22 +294,43 @@ def install(root: Path, slug: str, marketplace: str, plugin: str) -> None:
     if executable is None:
         raise ValueError("GitHub Copilot CLI is required for --install; install it and sign in")
     qualified = f"{plugin}@{marketplace}"
-    if marketplace not in run([executable, "plugin", "marketplace", "list"], root):
+    if not cli_has_entry(run([executable, "plugin", "marketplace", "list"], root), marketplace):
         print(run([executable, "plugin", "marketplace", "add", slug], root), end="")
-    if qualified not in run([executable, "plugin", "list"], root):
+    if not cli_has_entry(run([executable, "plugin", "list"], root), qualified):
         print(run([executable, "plugin", "install", qualified], root), end="")
     print(run([executable, "plugin", "enable", qualified], root), end="")
 
 
+def resolve_root(explicit: str | None) -> Path:
+    if explicit:
+        root = Path(explicit).resolve()
+        if not root.is_dir():
+            raise ValueError(f"--root {explicit} is not a directory")
+        return root
+    try:
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], check=True,
+            capture_output=True, text=True, encoding="utf-8",
+        ).stdout.strip()
+        if toplevel:
+            return Path(toplevel).resolve()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return Path(__file__).resolve().parent.parent
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", help="Repository root (default: current git toplevel)")
     parser.add_argument("--marketplace-name", help="Name when creating a marketplace")
     parser.add_argument("--plugin-name", help="Name when creating a plugin")
+    parser.add_argument("--version", help="Explicit plugin version (default: bump patch on change)")
     parser.add_argument("--install", action="store_true", help="Also install/enable via Copilot CLI")
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent.parent
     try:
-        result = sync(root, args.marketplace_name, args.plugin_name)
+        root = resolve_root(args.root)
+        print(f"Target repository: {root}")
+        result = sync(root, args.marketplace_name, args.plugin_name, args.version)
         if args.install:
             install(root, *result)
     except subprocess.CalledProcessError as error:
