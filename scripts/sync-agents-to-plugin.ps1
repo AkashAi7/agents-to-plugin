@@ -10,6 +10,7 @@ forwards arguments, guaranteeing identical behavior on every platform.
 [CmdletBinding()]
 param(
     [string]$Root,
+    [string]$AgentsDir,
     [string]$MarketplaceName,
     [string]$PluginName,
     [string]$Version,
@@ -26,6 +27,7 @@ if (-not $python) {
 
 $arguments = @("-B", (Join-Path $PSScriptRoot "sync-agents-to-plugin.py"))
 if ($Root) { $arguments += @("--root", $Root) }
+if ($AgentsDir) { $arguments += @("--agents-dir", $AgentsDir) }
 if ($MarketplaceName) { $arguments += @("--marketplace-name", $MarketplaceName) }
 if ($PluginName) { $arguments += @("--plugin-name", $PluginName) }
 if ($Version) { $arguments += @("--version", $Version) }

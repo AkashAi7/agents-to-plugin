@@ -36,6 +36,11 @@ class SyncTests(unittest.TestCase):
         path.write_text(f"---\nname: '{name}'\ndescription: Test agent\n---\n{body}\n")
         return path
 
+    def agent_in(self, directory, filename, name, body="Original"):
+        path = directory / filename
+        path.write_text(f"---\nname: '{name}'\ndescription: Test agent\n---\n{body}\n")
+        return path
+
     def read(self, *parts):
         return json.loads(self.root.joinpath(*parts).read_text(encoding="utf-8"))
 
@@ -65,6 +70,32 @@ class SyncTests(unittest.TestCase):
         before = [path.read_bytes() for path in paths]
         sync_agents.sync(self.root)
         self.assertEqual(before, [path.read_bytes() for path in paths])
+
+    def test_custom_agent_source_directory(self):
+        source = self.root / ".github" / "agents"
+        source.mkdir(parents=True)
+        (self.root / "agents" / "first.agent.md").unlink()
+        self.agent_in(source, "custom.agent.md", "Custom")
+
+        sync_agents.sync(self.root, agents_dir=".github/agents")
+
+        self.assertEqual(
+            self.read("plugin.json")["extensions"]["com.github.awesome-copilot"]["agents"],
+            ["./.github/agents/custom.agent.md"],
+        )
+        self.assertEqual(
+            self.read(".github", "plugin", "marketplace.json")["plugins"][0]["agents"],
+            ["./.github/agents/custom.agent.md"],
+        )
+        self.assertTrue(
+            (self.root / "com.github.copilot" / "agents" / "custom.agent.md").is_file()
+        )
+
+    def test_agent_source_directory_must_be_inside_repository(self):
+        with tempfile.TemporaryDirectory() as external:
+            with self.assertRaisesRegex(ValueError, "inside the repository root"):
+                sync_agents.sync(self.root, agents_dir=external)
+        self.assertFalse((self.root / "plugin.json").exists())
 
     def test_version_bumps_on_change_and_propagates_to_marketplace(self):
         sync_agents.sync(self.root)
@@ -207,6 +238,24 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "plugin.json").is_file())
 
+    def test_cli_accepts_custom_agent_source_directory(self):
+        source = self.root / "custom-agents"
+        source.mkdir()
+        self.agent_in(source, "custom.agent.md", "Custom")
+        script = Path(__file__).with_name("sync-agents-to-plugin.py")
+        result = subprocess.run(
+            [
+                sys.executable, "-B", str(script), "--root", str(self.root),
+                "--agents-dir", "custom-agents",
+            ],
+            cwd=self.root.parent, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.read("plugin.json")["extensions"]["com.github.awesome-copilot"]["agents"],
+            ["./custom-agents/custom.agent.md"],
+        )
+
     def test_cli_has_entry_requires_exact_token(self):
         output = "Installed plugins:\n  • my-agents-extra@market (v1.0.0)\n"
         self.assertFalse(sync_agents.cli_has_entry(output, "my-agents@market"))
@@ -229,6 +278,7 @@ class SyncTests(unittest.TestCase):
         wrapper = Path(__file__).with_name("sync-agents-to-plugin.ps1")
         content = wrapper.read_text()
         self.assertIn("sync-agents-to-plugin.py", content)
+        self.assertIn('"--agents-dir"', content)
         # The wrapper must not contain its own conversion logic.
         for marker in ("marketplace.json", "plugin.json\"", "managed-settings"):
             self.assertNotIn(marker, content)
