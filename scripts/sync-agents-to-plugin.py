@@ -3,8 +3,8 @@
 
 Generates/updates .github/plugin/marketplace.json, plugin.json,
 com.github.copilot/agents/ mirrors, and copilot/managed-settings.json
-from the agents/ directory. Stdlib only; idempotent; validates all
-inputs before mutating anything.
+from the selected agent source folder (agents/ by default). Stdlib only;
+idempotent; validates all inputs before mutating anything.
 """
 
 from __future__ import annotations
@@ -72,13 +72,26 @@ def bump_patch(version: str) -> str:
     return f"{major}.{minor}.{int(patch) + 1}"
 
 
-def discover_agents(root: Path) -> list[tuple[Path, str]]:
-    """Return (path, display name) for every agents/*.agent.md file.
+def resolve_agents_directory(root: Path, agents_dir: str | Path) -> Path:
+    root = root.resolve()
+    directory = Path(agents_dir)
+    if not directory.is_absolute():
+        directory = root / directory
+    directory = directory.resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"Agent directory must be inside the repository root: {directory}") from error
+    return directory
+
+
+def discover_agents(root: Path, agents_dir: str | Path = "agents") -> list[tuple[Path, str]]:
+    """Return (path, display name) for every *.agent.md file in the source folder.
 
     An *.agent.md file with missing, unopened, or unclosed frontmatter, or
     without a description, is an error. Other Markdown files are ignored.
     """
-    directory = root / "agents"
+    directory = resolve_agents_directory(root, agents_dir)
     if not directory.is_dir():
         raise ValueError(f"No agents directory found at {directory}")
     agents = []
@@ -137,15 +150,22 @@ def sync(
     marketplace_name: str | None = None,
     plugin_name: str | None = None,
     version: str | None = None,
+    agents_dir: str | Path = "agents",
 ) -> tuple[str, str, str]:
-    agents = discover_agents(root)
+    root = root.resolve()
+    agent_directory = resolve_agents_directory(root, agents_dir)
+    agents = discover_agents(root, agent_directory)
     owner, slug = resolve_slug(root)
     url = f"https://github.com/{slug}"
-    source_paths = [f"./agents/{path.name}" for path, _ in agents]
+    source_paths = [f"./{path.relative_to(root).as_posix()}" for path, _ in agents]
     namespace_paths = [f"./com.github.copilot/agents/{path.name}" for path, _ in agents]
     names = ", ".join(name for _, name in agents)
     summary = names if len(names) <= 120 else f"{len(agents)} agents"
-    description = f"Custom agents for {owner}, auto-generated from agents/. Includes: {summary}."
+    source_directory = agent_directory.relative_to(root).as_posix()
+    description = (
+        f"Custom agents for {owner}, auto-generated from {source_directory}/. "
+        f"Includes: {summary}."
+    )
 
     # --- Phase 1: read and validate every input before mutating anything ---
     manifest_path = root / "plugin.json"
@@ -322,6 +342,10 @@ def resolve_root(explicit: str | None) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", help="Repository root (default: current git toplevel)")
+    parser.add_argument(
+        "--agents-dir", default="agents",
+        help="Agent source folder inside the repository (default: agents)",
+    )
     parser.add_argument("--marketplace-name", help="Name when creating a marketplace")
     parser.add_argument("--plugin-name", help="Name when creating a plugin")
     parser.add_argument("--version", help="Explicit plugin version (default: bump patch on change)")
@@ -330,7 +354,9 @@ def main() -> int:
     try:
         root = resolve_root(args.root)
         print(f"Target repository: {root}")
-        result = sync(root, args.marketplace_name, args.plugin_name, args.version)
+        result = sync(
+            root, args.marketplace_name, args.plugin_name, args.version, args.agents_dir
+        )
         if args.install:
             install(root, *result)
     except subprocess.CalledProcessError as error:

@@ -20,11 +20,14 @@ GitHub Copilot supports distributing custom agents via [plugin marketplaces](htt
 
 ## Quick start
 
-From the root of any git repository that has an `agents/` directory and a GitHub `origin` remote:
+From the root of any git repository that has a folder of agents and a GitHub `origin` remote:
 
 ```bash
 # Python (any OS, Python 3.9+, stdlib only)
 python scripts/sync-agents-to-plugin.py
+
+# or specify a different source folder inside the repository
+python scripts/sync-agents-to-plugin.py --agents-dir .github/agents
 
 # or the PowerShell wrapper (delegates to the same Python engine)
 ./scripts/sync-agents-to-plugin.ps1
@@ -42,7 +45,7 @@ copilot plugin install <owner>-agents@<owner>-marketplace
 On every run it:
 
 1. **Resolves the target repository** — `--root PATH` if given, else the current `git rev-parse --show-toplevel`, else the script's parent repository. The resolved root is printed before anything is touched.
-2. **Discovers agents** — `agents/*.agent.md` files with closed YAML frontmatter containing a `description`. A malformed `*.agent.md` is a **hard error** (so a typo can't silently drop an agent from the plugin); other Markdown files are ignored with a notice.
+2. **Discovers agents** — `*.agent.md` files in `--agents-dir` (default `agents/`) with closed YAML frontmatter containing a `description`. The source folder must be inside the target repository. A malformed `*.agent.md` is a **hard error** (so a typo can't silently drop an agent from the plugin); other Markdown files are ignored with a notice.
 3. **Validates everything up front** — all existing manifests and settings are parsed and type/name/version-checked *before* any file is modified; failures leave the repository untouched.
 4. **Creates or updates `plugin.json`** — Agent Plugins 1.0 manifest (named `<owner>-agents` when created; existing names win). Names must be lowercase kebab/dot style.
 5. **Creates or updates `.github/plugin/marketplace.json`** — the plugin entry's `agents` **and `version`** are synchronized; existing metadata, authors, and unrelated plugins are preserved. Duplicate entries or a non-root plugin `source` are rejected (`./` and `.` are both accepted).
@@ -66,6 +69,7 @@ Re-running with no changes is byte-identical (no spurious bumps).
 | Python | PowerShell | Effect |
 |---|---|---|
 | `--root PATH` | `-Root PATH` | Target repository (default: current git toplevel) |
+| `--agents-dir PATH` | `-AgentsDir PATH` | Agent source folder inside the repository (default: `agents`) |
 | `--marketplace-name NAME` | `-MarketplaceName NAME` | Name used when *creating* a marketplace |
 | `--plugin-name NAME` | `-PluginName NAME` | Name used when *creating* a plugin manifest |
 | `--version X.Y.Z` | `-Version X.Y.Z` | Explicit version (default: auto patch-bump on change) |
@@ -92,7 +96,7 @@ Re-running with no changes is byte-identical (no spurious bumps).
 
 ## Agent file format
 
-Only `agents/*.agent.md` files count as agents, and they must look like this:
+Only top-level `*.agent.md` files in the selected source folder count as agents, and they must look like this:
 
 ```markdown
 ---
@@ -110,7 +114,7 @@ A `*.agent.md` without valid frontmatter or a description fails the run. Other `
 python -B -m unittest discover -s scripts -p "test_sync_agents_to_plugin.py"
 ```
 
-13 cases cover from-scratch creation, byte-identical idempotence, version bump/propagation, add/amend/remove cycles, unmanaged-file preservation, metadata/other-plugin preservation, rename cleanup of managed settings, malformed-input safety with zero partial writes, source-path equivalence, `--root`/git-toplevel resolution, exact-token CLI matching, the mocked install flow, and wrapper delegation.
+16 cases cover from-scratch creation, byte-identical idempotence, custom agent-folder discovery, version bump/propagation, add/amend/remove cycles, unmanaged-file preservation, metadata/other-plugin preservation, rename cleanup of managed settings, malformed-input safety with zero partial writes, source-path equivalence, `--root`/git-toplevel resolution, exact-token CLI matching, the mocked install flow, and wrapper delegation.
 
 ## Known limitations
 
